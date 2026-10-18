@@ -1,0 +1,213 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS source
+RUN apk add --no-cache gpgv
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-${VERSION}/sleuthkit-${VERSION}.tar.gz /src/
+ADD https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-${VERSION}/sleuthkit-${VERSION}.tar.gz.asc /src/
+ARG LIBEWF_VERSION
+ARG LIBEWF_SHA256
+ADD --checksum=sha256:${LIBEWF_SHA256} https://github.com/libyal/libewf-legacy/releases/download/${LIBEWF_VERSION}/libewf-${LIBEWF_VERSION}.tar.gz /src/
+ADD https://github.com/libyal/libewf-legacy/releases/download/${LIBEWF_VERSION}/libewf-${LIBEWF_VERSION}.tar.gz.asc /src/
+# Brian Carrier's release signing key, fingerprint 0917 A7EE 58A9 308B 13D3 9633 38AD 602E C745 4C8B,
+# a DSA-1024 key from 2004 without expiry date that signs with SHA-1, and
+# Joachim Metz's key for libewf, fingerprint 0ED9 020D A90D 3F6E 70BD 3945 D962 5E5D 7AD0 177E,
+# an RSA-2048 key without expiry date. A release signed with any other key
+# fails here until that key is added to the keyring in keys/.
+COPY keys/sleuthkit-release.gpg /tmp/sleuthkit-release.gpg
+COPY keys/libewf-release.gpg /tmp/libewf-release.gpg
+WORKDIR /src
+RUN set -eu; \
+    gpgv --keyring /tmp/sleuthkit-release.gpg "sleuthkit-${VERSION}.tar.gz.asc" "sleuthkit-${VERSION}.tar.gz"; \
+    gpgv --keyring /tmp/libewf-release.gpg "libewf-${LIBEWF_VERSION}.tar.gz.asc" "libewf-${LIBEWF_VERSION}.tar.gz"; \
+    mkdir sleuthkit libewf; \
+    tar -xzf "sleuthkit-${VERSION}.tar.gz" -C sleuthkit --strip-components=1; \
+    tar -xzf "libewf-${LIBEWF_VERSION}.tar.gz" -C libewf --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN apk add --no-cache \
+      build-base \
+      perl \
+      scanelf \
+      sqlite-dev \
+      zlib-dev
+ARG JOBS
+
+# Alpine's libewf is the experimental series, which dropped the
+# libewf_handle_read_random function The Sleuth Kit calls, so libewf is built
+# here from the legacy series and installed twice: into /usr/local for the
+# build below and into /out for the image. Only the library and the libyal
+# libraries bundled with it are built, without OpenSSL, libuuid or FUSE, which
+# only the ewftools use.
+ARG LIBEWF_VERSION
+COPY --link --from=source /src/libewf /src/libewf
+WORKDIR /src/libewf
+RUN printf '%s\n' "${LIBEWF_VERSION}" | grep -Eqx '[0-9]{8}' \
+      || { echo "unexpected LIBEWF_VERSION: ${LIBEWF_VERSION}" >&2; exit 1; }; \
+    ./configure \
+      --prefix=/usr/local \
+      --disable-static \
+      --disable-nls \
+      --disable-python \
+      --with-libfuse=no \
+      --with-libuuid=no \
+      --with-openssl=no \
+      | tee /tmp/libewf-configure.log; \
+    for want in 'DEFLATE compression support: zlib' 'ADLER32 checksum support: zlib' \
+      'libbfio support: local' 'GUID/UUID support: no' 'FUSE support: no'; do \
+      grep -Eq "^ +${want%%: *}: +${want#*: }\$" /tmp/libewf-configure.log \
+        || { echo "libewf configure did not report ${want}" >&2; exit 1; }; \
+    done; \
+    grep -Eq "^#define LIBEWF_VERSION_STRING[[:space:]]+\"${LIBEWF_VERSION}\"\$" include/libewf/definitions.h \
+      || { echo "include/libewf/definitions.h is not for ${LIBEWF_VERSION}" >&2; exit 1; }; \
+    for d in include common libcerror libcthreads libcdata libcdatetime libclocale libcnotify libcsplit \
+      libuna libcfile libcpath libbfio libfcache libfdata libfvalue libmfdata libhmac libewf; do \
+      make -C "$d" -j"${JOBS:-$(nproc)}"; \
+    done; \
+    make -C include install; \
+    make -C libewf install-strip; \
+    rm /usr/local/lib/libewf.la; \
+    mkdir -p /out/usr/local/lib; \
+    cp -P /usr/local/lib/libewf.so.* /out/usr/local/lib/; \
+    ls /out/usr/local/lib/libewf.so.*
+
+COPY --link --from=source /src/sleuthkit /src/sleuthkit
+WORKDIR /src/sleuthkit
+ARG VERSION
+# configure leaves out an image format library, or uses the SQLite copy in the
+# tarball, without failing, so its summary is checked. Alpine has no afflib,
+# libvhdi, libvmdk, libvslvm or libbfio, so AFF, VHD, VMDK and LVM images are
+# not supported. libtsk is built as a shared library only, so the tools load
+# one copy of it from /usr/local/lib instead of each linking it in. GCC 15
+# compiles C as C23 by default, in which true and false are keywords that
+# tsk_unicode.c defines as macros. tsk/pool compiles C++ with -Werror and
+# includes <sys/fcntl.h>, which on musl only has a #warning that points to
+# <fcntl.h>, so that warning must not fail the build. The Java bindings are
+# not built.
+# jpeg_extract, a fiwalk plugin that runs the exif program, is removed, since
+# the image has no exif.
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    ./configure \
+      --prefix=/usr/local \
+      --disable-static \
+      --disable-java \
+      --disable-cppunit \
+      --without-afflib \
+      --without-libbfio \
+      --without-libvhdi \
+      --without-libvmdk \
+      --without-libvslvm \
+      PERL=/usr/bin/perl \
+      CFLAGS='-O2 -std=gnu17' \
+      CXXFLAGS='-O2 -Wno-error=cpp' \
+      | tee /tmp/configure.log; \
+    for want in 'afflib support: no' 'libewf support: yes' 'zlib support: yes' 'fiwalk support: yes' \
+      'libbfio support: no' 'libvhdi support: no' 'libvmdk support: no' 'libvslvm support: no' \
+      'Java/JNI support: no' 'Multithreading: yes'; do \
+      grep -Eq "^ +${want%%: *}: +${want#*: }\$" /tmp/configure.log \
+        || { echo "configure did not report ${want}" >&2; exit 1; }; \
+    done; \
+    grep -Fqx 'checking which sqlite3 to use... system' /tmp/configure.log \
+      || { echo "configure chose the bundled SQLite" >&2; exit 1; }; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make install-strip DESTDIR=/out; \
+    rm -rf /out/usr/local/include /out/usr/local/lib/pkgconfig /out/usr/local/share/man; \
+    rm -f /out/usr/local/lib/libtsk.la /out/usr/local/lib/libtsk.so /out/usr/local/bin/jpeg_extract; \
+    printf '%s\n' blkcalc blkcat blkls blkstat fcat ffind fiwalk fls fsstat hfind icat ifind ils img_cat \
+      img_stat istat jcat jls mactime mmcat mmls mmstat pstat sigfind sorter srch_strings tsk_comparedir \
+      tsk_gettimes tsk_imageinfo tsk_loaddb tsk_recover usnjls > /tmp/tools.expected; \
+    for f in /out/usr/local/bin/*; do echo "${f##*/}"; done | LC_ALL=C sort > /tmp/tools; \
+    if ! cmp -s /tmp/tools.expected /tmp/tools; then \
+      echo "the install does not have the expected programs:" >&2; \
+      diff /tmp/tools.expected /tmp/tools >&2 || true; \
+      exit 1; \
+    fi; \
+    for s in mactime sorter; do \
+      test "$(head -n 1 "/out/usr/local/bin/$s")" = '#!/usr/bin/perl -w' \
+        || { echo "$s does not start with #!/usr/bin/perl -w" >&2; exit 1; }; \
+    done; \
+    lib="$(find /out/usr/local/lib -name 'libtsk.so.*' -type f)"; \
+    scanelf --needed --nobanner --format '%n#p' "$lib" | tr ',' '\n' > /tmp/libtsk-needed; \
+    for so in libewf libsqlite3 libz; do \
+      grep -q "^${so}\.so\." /tmp/libtsk-needed || { echo "libtsk does not load ${so}" >&2; exit 1; }; \
+    done; \
+    export LD_LIBRARY_PATH=/out/usr/local/lib; \
+    test "$(/out/usr/local/bin/fls -V)" = "The Sleuth Kit ver ${VERSION}" \
+      || { echo "fls -V does not print The Sleuth Kit ver ${VERSION}" >&2; exit 1; }; \
+    /out/usr/local/bin/fiwalk -V > /tmp/fiwalk-version; \
+    /out/usr/local/bin/img_stat -i list 2> /tmp/image-types || true; \
+    grep -Eq "^LIBEWF Version: +${LIBEWF_VERSION}\$" /tmp/fiwalk-version \
+      || { cat /tmp/fiwalk-version >&2; exit 1; }
+
+ARG BASE_IMAGE
+ARG SOURCE_SHA256
+ARG LIBEWF_SHA256
+# runtime-deps lists the so: names the programs need, minus the libraries
+# built here, plus the packages in runtime-deps.alpine: Perl for mactime and
+# sorter, file for sorter, and the time zone data that mactime -z reads.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    set -eu; \
+    meta=/out/usr/local/share/randomcontainers/sleuthkit; \
+    mkdir -p "$meta/licenses/libewf"; \
+    cp licenses/README.md licenses/cpl1.0.txt licenses/IBM-LICENSE licenses/GNUv2-COPYING \
+      licenses/bsd.txt licenses/mit.txt "$meta/licenses/"; \
+    cp /src/libewf/AUTHORS /src/libewf/COPYING /src/libewf/COPYING.LESSER "$meta/licenses/libewf/"; \
+    notice() { awk -v m="$2" '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (index(b, m)) printf "%s", b }' "$1"; }; \
+    notice tsk/base/md5c.c 'License to copy and use' > "$meta/licenses/COPYING.md5c"; \
+    notice tsk/base/tsk_unicode.c 'Limitations on Rights to Redistribute' > "$meta/licenses/COPYING.tsk_unicode"; \
+    notice tsk/fs/lzvn.c 'Redistribution and use' > "$meta/licenses/COPYING.lzvn"; \
+    notice tsk/auto/guid.cpp 'Permission is hereby granted' > "$meta/licenses/COPYING.guid"; \
+    notice tools/fiwalk/src/sha2.c 'Redistribution and use' > "$meta/licenses/COPYING.sha2"; \
+    notice tools/fiwalk/src/base64.cpp 'Copyright (c)' > "$meta/licenses/COPYING.base64"; \
+    awk 'NR == 1, /ADVISED OF THE POSSIBILITY OF SUCH DAMAGE/' tools/timeline/mactime.base > "$meta/licenses/COPYING.mactime"; \
+    for f in md5c:'RSA Data Security' tsk_unicode:'Unicode, Inc.' lzvn:'Apple Inc.' guid:'Graeme Hill' \
+      sha2:'Olivier Gay' base64:'International Business Machines' mactime:'Dan Farmer'; do \
+      grep -Fq "${f#*:}" "$meta/licenses/COPYING.${f%%:*}" \
+        || { echo "COPYING.${f%%:*} lacks ${f#*:}" >&2; exit 1; }; \
+    done; \
+    for f in "$meta"/licenses/* "$meta"/licenses/libewf/*; do test -s "$f"; done; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-${VERSION}/sleuthkit-${VERSION}.tar.gz" \
+      "https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-${VERSION}/sleuthkit-${VERSION}.tar.gz.asc" \
+      "https://github.com/libyal/libewf-legacy/releases/download/${LIBEWF_VERSION}/libewf-${LIBEWF_VERSION}.tar.gz" \
+      "https://github.com/libyal/libewf-legacy/releases/download/${LIBEWF_VERSION}/libewf-${LIBEWF_VERSION}.tar.gz.asc" \
+      "https://github.com/randomcontainers/sleuthkit/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "source-sha256: ${SOURCE_SHA256}"; \
+      echo "libewf: ${LIBEWF_VERSION}"; \
+      echo "libewf-sha256: ${LIBEWF_SHA256}"; \
+      echo "compiler: $(c++ --version | head -n 1)"; \
+      echo "libewf configure: $(sed -n 's/^  \$ \.\/configure //p' /src/libewf/config.log)"; \
+      echo "configure: $(sed -n 's/^  \$ \.\/configure //p' config.log)"; \
+      sed -n '/^Building:/,/Multithreading:/p' /tmp/configure.log; \
+      cat /tmp/fiwalk-version /tmp/image-types; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | LC_ALL=C sort -u > /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    test -s /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/sleuthkit/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "fls"]
+CMD ["-V"]
