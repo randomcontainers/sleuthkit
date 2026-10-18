@@ -1,0 +1,350 @@
+name: sleuthkit
+title: The Sleuth Kit
+summary: Forensic tools for disk images, such as mmls, fls, icat, tsk_recover and mactime, that read partitions and file systems and recover deleted files.
+homepage: https://www.sleuthkit.org/sleuthkit/
+# The Sleuth Kit is CPL-1.0, with the code taken over from The Coroner's
+# Toolkit and the HFS+ and ISO 9660 code from Crucial Security and ATC-NY
+# under IPL-1.0. Compiled in under other terms: srch_strings, a
+# standalone program from GNU binutils (GPL-2.0-or-later); the LZVN decoder
+# and fiwalk's SHA-2 code (BSD-3-Clause); the GUID code (MIT); fiwalk's
+# base64 code (ISC, with an IBM notice); the MD5 code, derived from the RSA
+# Data Security, Inc. MD5 Message-Digest Algorithm; the Unicode ConvertUTF
+# code; mactime's notice from Dan Farmer; and public domain files.
+# libewf, built for the Alpine images, is LGPL-3.0-or-later.
+license: CPL-1.0 AND IPL-1.0 AND GPL-2.0-or-later AND LGPL-3.0-or-later AND BSD-3-Clause AND MIT AND ISC AND RSA-MD AND LicenseRef-IBM-base64 AND LicenseRef-ConvertUTF AND LicenseRef-mactime AND LicenseRef-Public-Domain
+source-release: true
+upstream:
+  source: github-release
+  repository: sleuthkit/sleuthkit
+  # Release tags look like sleuthkit-4.15.0.
+  tag-pattern: '^sleuthkit-(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 4.15.0
+  artifact:
+    url: https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-{version}/sleuthkit-{version}.tar.gz
+    signature: https://github.com/sleuthkit/sleuthkit/releases/download/sleuthkit-{version}/sleuthkit-{version}.tar.gz.asc
+    sha256: 3a8c1e7d18a9b81f3e5e8aa78313974aceaafc6e051d636bc92cd7168286eca9
+  # Alpine packages the experimental libewf series, which lacks the API The
+  # Sleuth Kit uses for E01 images. The Alpine images build libewf from the
+  # legacy series instead, the series Ubuntu's libewf-dev packages. The hash
+  # is the digest GitHub records for the release asset; the build also checks
+  # the signature.
+  extra-artifacts:
+    libewf:
+      version: "20140817"
+      url: https://github.com/libyal/libewf-legacy/releases/download/{version}/libewf-{version}.tar.gz
+      signature: https://github.com/libyal/libewf-legacy/releases/download/{version}/libewf-{version}.tar.gz.asc
+      sha256: 6dbbefe68e913243dc000b9daaf59f293e33c2340024f7dfb144f1ad90b06544
+      distros: [alpine]
+image:
+  entrypoint: [fls]
+  cmd: [-V]
+test:
+  - |
+    for t in blkcalc blkcat blkls blkstat fcat ffind fls fsstat hfind icat ifind ils img_cat img_stat \
+      istat jcat jls mactime mmcat mmls mmstat pstat sigfind sorter tsk_comparedir tsk_gettimes \
+      tsk_imageinfo tsk_loaddb tsk_recover usnjls; do
+      if ! "$t" -V > version.txt 2> version.err; then
+        echo "$t -V failed:" >&2
+        cat version.txt version.err >&2
+        exit 1
+      fi
+      if [ "$(cat version.txt)" != "The Sleuth Kit ver $VERSION" ]; then
+        echo "$t -V printed '$(cat version.txt)', expected 'The Sleuth Kit ver $VERSION'" >&2
+        exit 1
+      fi
+    done
+    fiwalk -V > fiwalk-version.txt
+    if ! grep -Fqx "SleuthKit Version: $VERSION" fiwalk-version.txt; then
+      echo "fiwalk -V printed:" >&2
+      cat fiwalk-version.txt >&2
+      exit 1
+    fi
+    for s in mactime sorter; do
+      first=$(head -n 1 "/usr/local/bin/$s")
+      if [ "$first" != '#!/usr/bin/perl -w' ]; then
+        echo "/usr/local/bin/$s starts with '$first'" >&2
+        exit 1
+      fi
+    done
+    test -s /usr/local/share/tsk/sorter/default.sort
+    test ! -e /usr/local/bin/jpeg_extract
+  - |
+    # Ubuntu links the distro's afflib, libewf, libvhdi, libvmdk and
+    # libvslvm; Alpine links only libewf, built from the legacy series.
+    img_stat -i list 2> image-types.txt || true
+    awk 'NR > 1 { printf "%s ", $1 }' image-types.txt > image-types.got
+    if [ -f /etc/alpine-release ]; then
+      printf 'raw ewf ' > image-types.expected
+      afflib='^\*\*\* NO AFFLIB SUPPORT \*\*\*$'
+    else
+      printf 'raw aff afd afm afflib ewf vmdk vhd ' > image-types.expected
+      afflib='^AFFLIB Version: +[0-9]'
+    fi
+    if ! cmp -s image-types.expected image-types.got; then
+      echo "img_stat -i list printed:" >&2
+      cat image-types.txt >&2
+      echo "expected the types: $(cat image-types.expected)" >&2
+      exit 1
+    fi
+    fiwalk -V > fiwalk-version.txt
+    if ! grep -Eq '^LIBEWF Version: +2014[0-9]{4}$' fiwalk-version.txt || ! grep -Eq "$afflib" fiwalk-version.txt; then
+      echo "fiwalk -V printed:" >&2
+      cat fiwalk-version.txt >&2
+      exit 1
+    fi
+    # Only libewf gets past the EWF signature and then rejects the section
+    # header, whose checksum is wrong.
+    printf 'EVF\011\015\012\377\000\001\001\000\000\000' > damaged.E01
+    dd if=/dev/zero bs=512 count=1 >> damaged.E01 2> /dev/null
+    status=0
+    img_stat -i ewf damaged.E01 > damaged.out 2> damaged.err || status=$?
+    if [ "$status" -eq 0 ] || ! grep -Fq 'ewf_open file: damaged.E01: Error opening' damaged.err; then
+      echo "img_stat -i ewf damaged.E01 exited with $status and printed:" >&2
+      cat damaged.out damaged.err >&2
+      exit 1
+    fi
+    printf 'not an image\n' > plain.E01
+    status=0
+    img_stat -i ewf plain.E01 > plain.out 2> plain.err || status=$?
+    if [ "$status" -eq 0 ] || ! grep -Fq 'Not an EWF file' plain.err; then
+      echo "img_stat -i ewf plain.E01 exited with $status and printed:" >&2
+      cat plain.out plain.err >&2
+      exit 1
+    fi
+  - |
+    # A 64 KiB FAT12 file system: HELLO.TXT in cluster 2 and the deleted
+    # SECRET.TXT in cluster 3, both dated 2020-01-02 03:04:06.
+    put() { dd of=fat.img bs=1 seek="$1" conv=notrunc 2> /dev/null; }
+    dd if=/dev/zero of=fat.img bs=512 count=128 2> /dev/null
+    printf '\353\074\220MSDOS5.0\000\002\001\001\000\002\020\000\200\000\370\001\000\040\000\002\000' | put 0
+    printf '\200\000\051\170\126\064\022TESTVOL    FAT12   ' | put 36
+    printf '\125\252' | put 510
+    printf '\370\377\377\377\017\000' | put 512
+    printf '\370\377\377\377\017\000' | put 1024
+    printf 'TESTVOL    \010' | put 1536
+    printf 'HELLO   TXT\040\000\000\203\030\042\120\042\120\000\000\203\030\042\120\002\000\014\000\000\000' | put 1568
+    printf '\345ECRET  TXT\040\000\000\203\030\042\120\042\120\000\000\203\030\042\120\003\000\007\000\000\000' | put 1600
+    printf 'hello world\n' | put 2048
+    printf 'secret\n' | put 2560
+    printf 'hello world\n' > hello.expected
+    printf 'secret\n' > secret.expected
+    img_stat fat.img > img_stat.txt
+    fsstat fat.img > fsstat.txt
+    fls fat.img > fls.txt
+    for want in 'img_stat.txt:Image Type: raw' 'img_stat.txt:Size in bytes: 65536' \
+      'fsstat.txt:File System Type: FAT12' 'fsstat.txt:Volume ID: 0x12345678' \
+      'fsstat.txt:Volume Label (Boot Sector): TESTVOL'; do
+      if ! grep -Fq "${want#*:}" "${want%%:*}"; then
+        echo "${want%%:*} lacks '${want#*:}':" >&2
+        cat "${want%%:*}" >&2
+        exit 1
+      fi
+    done
+    inode=$(ifind -n HELLO.TXT fat.img)
+    deleted=$(sed -n 's/^r\/r \* \([0-9]*\):[[:space:]]_ECRET\.TXT$/\1/p' fls.txt)
+    if ! grep -Eq "^r/r $inode:[[:space:]]HELLO\.TXT\$" fls.txt || [ -z "$deleted" ]; then
+      echo "fls printed (ifind gave inode '$inode' for HELLO.TXT):" >&2
+      cat fls.txt >&2
+      exit 1
+    fi
+    icat fat.img "$inode" > hello.out
+    icat -r fat.img "$deleted" > secret.out
+    if ! cmp -s hello.expected hello.out || ! cmp -s secret.expected secret.out; then
+      echo "icat printed '$(cat hello.out)' and '$(cat secret.out)'" >&2
+      exit 1
+    fi
+    name=$(ffind fat.img "$inode")
+    if [ "$name" != /HELLO.TXT ]; then
+      echo "ffind printed '$name' for inode $inode" >&2
+      exit 1
+    fi
+    istat fat.img "$inode" > istat.txt
+    if ! grep -Fqx 'Size: 12' istat.txt; then
+      cat istat.txt >&2
+      exit 1
+    fi
+  - |
+    tsk_recover -e fat.img all > recover-all.log
+    tsk_recover fat.img deleted > recover-deleted.log
+    for f in all/HELLO.TXT:hello all/_ECRET.TXT:secret deleted/_ECRET.TXT:secret; do
+      if ! cmp -s "${f#*:}.expected" "${f%%:*}"; then
+        echo "tsk_recover did not write ${f%%:*} as expected; it wrote:" >&2
+        find all deleted -type f >&2
+        exit 1
+      fi
+    done
+    if [ -e deleted/HELLO.TXT ]; then
+      echo "tsk_recover without -e recovered the allocated HELLO.TXT" >&2
+      exit 1
+    fi
+    # FAT stores local time; TZ=UTC makes fls read it as UTC.
+    TZ=UTC fls -r -m / fat.img > body.txt
+    awk -F'|' '$2 == "/HELLO.TXT" { print $7, $8, $9, $11 }' body.txt > body.got
+    printf '12 1577923200 1577934246 1577934246\n' > body.expected
+    if ! cmp -s body.expected body.got; then
+      echo "fls -m printed (expected size, atime, mtime, crtime '$(cat body.expected)'):" >&2
+      cat body.txt >&2
+      exit 1
+    fi
+    mactime -b body.txt -d -y > timeline-utc.csv
+    mactime -b body.txt -d -z Europe/Berlin > timeline-berlin.csv
+    if ! grep -Eq '^2020-01-02T03:04:06Z,12,m\.\.b,[^,]*,0,0,[0-9]+,"/HELLO\.TXT"$' timeline-utc.csv; then
+      cat timeline-utc.csv >&2
+      exit 1
+    fi
+    if ! grep -Eq '^Thu Jan 02 2020 04:04:06,12,m\.\.b,[^,]*,0,0,[0-9]+,"/HELLO\.TXT"$' timeline-berlin.csv; then
+      echo "mactime -z Europe/Berlin printed:" >&2
+      cat timeline-berlin.csv >&2
+      exit 1
+    fi
+  - |
+    # A disk with an MBR and one FAT12 partition from sector 1 to 128, and
+    # the FAT12 image split in two raw segments.
+    dd if=/dev/zero of=disk.img bs=512 count=1 2> /dev/null
+    printf '\000\000\002\000\001\000\040\000\001\000\000\000\200\000\000\000' | dd of=disk.img bs=1 seek=446 conv=notrunc 2> /dev/null
+    printf '\125\252' | dd of=disk.img bs=1 seek=510 conv=notrunc 2> /dev/null
+    cat fat.img >> disk.img
+    mmls disk.img > mmls.txt
+    slot=$(awk '/DOS FAT12 \(0x01\)$/ && $3 == "0000000001" && $5 == "0000000128" { sub(":", "", $1); print $1 }' mmls.txt)
+    if [ -z "$slot" ]; then
+      echo "mmls printed:" >&2
+      cat mmls.txt >&2
+      exit 1
+    fi
+    mmcat disk.img "$slot" > partition.img
+    cmp fat.img partition.img
+    fls -o 1 disk.img > fls-partition.txt
+    dd if=fat.img of=split.001 bs=32768 count=1 2> /dev/null
+    dd if=fat.img of=split.002 bs=32768 skip=1 2> /dev/null
+    img_stat split.001 > img_stat-split.txt
+    fls split.001 > fls-split.txt
+    for f in fls-partition.txt fls-split.txt; do
+      if ! grep -Eq '^r/r [0-9]+:[[:space:]]HELLO\.TXT$' "$f"; then
+        cat "$f" >&2
+        exit 1
+      fi
+    done
+    if ! grep -Fqx 'Size in bytes: 65536' img_stat-split.txt || ! grep -Fq 'split.002' img_stat-split.txt; then
+      cat img_stat-split.txt >&2
+      exit 1
+    fi
+  - |
+    srch_strings -t d fat.img > strings.txt
+    if ! grep -Eq '^ *2048 hello world$' strings.txt; then
+      cat strings.txt >&2
+      exit 1
+    fi
+    # sigfind reads until a read fails, so it always exits with 1 after the
+    # last block, here block 128 of 512 bytes.
+    status=0
+    sigfind -o 510 55AA fat.img > sigfind.txt 2> sigfind.err || status=$?
+    if [ "$status" -ne 1 ] || ! grep -Fqx 'error reading bytes 128' sigfind.err || ! grep -Fqx 'Block: 0 (-)' sigfind.txt; then
+      echo "sigfind exited with $status and printed:" >&2
+      cat sigfind.txt sigfind.err >&2
+      exit 1
+    fi
+    md5=$(md5sum < hello.expected | cut -d ' ' -f 1)
+    printf '%s  hello.txt\n' "$md5" > hashes.txt
+    hfind -i md5sum hashes.txt > hfind-index.log
+    hfind hashes.txt "$md5" 00000000000000000000000000000000 > hfind.txt
+    if ! grep -iFq "$md5" hfind.txt || ! grep -Fq hello.txt hfind.txt || ! grep -Fq 'Hash Not Found' hfind.txt; then
+      cat hfind-index.log hfind.txt >&2
+      exit 1
+    fi
+    fiwalk -X fiwalk.xml fat.img > fiwalk.log 2>&1
+    if ! grep -Fq '<filename>HELLO.TXT</filename>' fiwalk.xml || ! grep -Fq "<hashdigest type='md5'>$md5</hashdigest>" fiwalk.xml; then
+      cat fiwalk.log fiwalk.xml >&2
+      exit 1
+    fi
+    tsk_loaddb -d case.db fat.img > loaddb.log
+    if [ "$(head -c 15 case.db)" != 'SQLite format 3' ]; then
+      echo "tsk_loaddb did not write an SQLite database:" >&2
+      cat loaddb.log >&2
+      exit 1
+    fi
+    # sorter runs icat and file on each file and lists it under a category.
+    mkdir sorted
+    sorter -d sorted fat.img > sorter.log
+    if ! grep -Fq HELLO.TXT sorted/text.txt; then
+      cat sorter.log >&2
+      ls -l sorted >&2
+      exit 1
+    fi
+  - |
+    # fat.img from the third test as a one-segment EnCase (E01) image with two
+    # header sections, both 32 KiB chunks compressed with zlib, and the MD5 of
+    # the data. Every read goes through libewf.
+    base64 -d > fat.E01 <<'EOF'
+    RVZGCQ0K/wABAQAAAGhlYWRlcgAAAAAAAAAAAACmAAAAAAAAAJkAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKkDr+h42jPkyk3MzONK5szjTORM5SzhTCzjzC/j
+    zOUs5SzgLOLiBAEjA0MTAwtDc06fzLzSCiDXyEDBUMFIwVjBRMEMnWvAmcTFxQAAT7URSWhlYWRl
+    cgAAAAAAAAAAAAA/AQAAAAAAAJkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAEMDXtJ42jPkyk3MzONK5szjTORM5SzhTCzjzC/jzOUs5SzgLOLiBAEjA0MTAwtD
+    c06fzLzSCiDXyEDBUMFIwVjBRMEMnWvAmcTFxQAAT7URSXZvbHVtZQAAAAAAAAAAAACnBQAAAAAA
+    AGgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALEDjO4BAAAA
+    AgAAAEAAAAAAAgAAgAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAgAAAEAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAACQFmJHNlY3RvcnMAAAAAAAAAAAD/BgAAAAAAAFgBAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGIEwRl42u3UsUrDYBQF4D9xUERQ
+    nBxDNxexopuLaMQhkmL+FncNOAQKVdCx4Av4HL6Xky/QLQZEEOkDVPJ9yx3Odg7cz9O36+qirE4O
+    DkOaJCHdCfOwSEIW0vBjHvZfJse7Ma/ipCyyzuVZHB51N/Cvjd8XbdtuK6K37N9vv576xrL8Ki+K
+    sgvjbey+/eveYDQYfd80bHX5R35+k8dl+VpYV+/Ke6ibZpo9T2fN/aY2+uexvpvVT6YHAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAPjrC4K1KiB42u3BAQEAAACAkP6v7ggKAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAABiAAAABdGFibGUAAAAAAAAAAAAAAG8HAAAAAAAAcAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA7wJUvQIAAAAAAAAAAAAAAAAA
+    AAAAAAAAAwA8APMFAIDLBgCAygIBDnRhYmxlMgAAAAAAAAAAAADfBwAAAAAAAHAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJED6uICAAAAAAAAAAAAAAAAAAAA
+    AAAAAAMAPADzBQCAywYAgMoCAQ5oYXNoAAAAAAAAAAAAAAAATwgAAAAAAABwAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABsAumbr6Y2OlXmh6XO3o7IHfHEGQAA
+    AAAAAAAAAAAAAAAAAAAaCdfdZG9uZQAAAAAAAAAAAAAAAE8IAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/gF+hw==
+    EOF
+    img_stat fat.E01 > ewf-stat.out
+    tr -s '\t' ' ' < ewf-stat.out > ewf-stat.txt
+    md5=$(md5sum < fat.img | cut -d ' ' -f 1)
+    for want in 'Image Type: ewf' 'Size of data in bytes: 65536' 'Sector size: 512' "MD5 hash of data: $md5"; do
+      if ! grep -Fqx "$want" ewf-stat.txt; then
+        echo "img_stat fat.E01 lacks '$want':" >&2
+        cat ewf-stat.out >&2
+        exit 1
+      fi
+    done
+    img_cat fat.E01 > ewf.img
+    fls fat.E01 > fls-ewf.txt
+    inode=$(sed -n 's/^r\/r \([0-9]*\):[[:space:]]HELLO\.TXT$/\1/p' fls-ewf.txt)
+    if [ -z "$inode" ]; then
+      cat fls-ewf.txt >&2
+      exit 1
+    fi
+    icat fat.E01 "$inode" > hello-ewf.out
+    if ! cmp -s fat.img ewf.img || ! cmp -s hello.expected hello-ewf.out; then
+      echo "img_cat and icat did not read fat.E01 back as fat.img" >&2
+      exit 1
+    fi
+examples:
+  - title: Show the partition table of a disk image
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" --entrypoint mmls ghcr.io/randomcontainers/sleuthkit disk.img
+  - title: List every file of the partition at sector 2048, deleted ones included
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" ghcr.io/randomcontainers/sleuthkit -r -o 2048 disk.img
+  - title: Recover the deleted files of that partition into recovered/
+    command: mkdir -p recovered && docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/evidence:ro" -v "$PWD/recovered:/work" --entrypoint tsk_recover ghcr.io/randomcontainers/sleuthkit -o 2048 /evidence/disk.img .
+  - title: Write a timeline of the file system as CSV
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" --entrypoint sh ghcr.io/randomcontainers/sleuthkit -c 'fls -r -m / -o 2048 disk.img | mactime -d -y' > timeline.csv
